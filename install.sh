@@ -7,123 +7,95 @@ BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${BLUE}=========================================${NC}"
-echo -e "${BLUE}   Cloudflare Panel Installer (GitHub)   ${NC}"
-echo -e "${BLUE}=========================================${NC}"
+echo -e "${BLUE}=== Arista Panel (Browser Login Mode) ===${NC}"
 
-# 1. نصب پیش‌نیازها
-echo -e "${YELLOW}[*] Checking dependencies...${NC}"
-pkg install jq curl -y > /dev/null 2>&1
+# 1. نصب Node.js و Wrangler (پیش‌نیازهای لاگین مرورگر)
+echo -e "${YELLOW}[*] Checking prerequisites...${NC}"
 
-# 2. دانلود فایل ورکر از گیتهاب شما
-echo -e "${YELLOW}[*] Downloading worker.js from GitHub...${NC}"
-# لینک فایل خام (Raw) از ریپازیتوری شما
+if ! command -v node &> /dev/null; then
+    echo "Installing Node.js (Required for browser login)..."
+    pkg install nodejs -y
+fi
+
+if ! command -v wrangler &> /dev/null; then
+    echo -e "${YELLOW}[*] Installing Cloudflare Wrangler (This may take a minute)...${NC}"
+    npm install -g wrangler
+fi
+
+# 2. دانلود فایل ورکر از گیتهاب
+echo -e "${YELLOW}[*] Downloading worker code...${NC}"
 GITHUB_URL="https://raw.githubusercontent.com/Ali-Anv1/Test/main/worker.js"
-
 curl -sSL $GITHUB_URL -o worker.js
 
-if [ ! -f "worker.js" ] || [ ! -s "worker.js" ]; then
-    echo -e "${RED}[!] Error: Failed to download worker.js! Check your internet or GitHub URL.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}[+] Worker code downloaded successfully.${NC}"
-
-# 3. دریافت توکن
-echo -e "${YELLOW}----------------------------------------${NC}"
-read -p "Enter Cloudflare API Token: " CF_TOKEN
-
-echo -e "${YELLOW}[*] Verifying Token...${NC}"
-VERIFY_RES=$(curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
-     -H "Authorization: Bearer $CF_TOKEN" \
-     -H "Content-Type: application/json")
-
-STATUS=$(echo $VERIFY_RES | jq -r '.success')
-
-if [ "$STATUS" != "true" ]; then
-    echo -e "${RED}[!] Invalid Token. Please check permissions (Workers:Edit, KV:Edit).${NC}"
+if [ ! -f "worker.js" ]; then
+    echo -e "${RED}[!] Failed to download worker.js${NC}"
     exit 1
 fi
 
-ACCOUNT_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
-     -H "Authorization: Bearer $CF_TOKEN" \
-     -H "Content-Type: application/json" | jq -r '.result[0].id')
+# 3. لاگین با مرورگر
+echo -e "${BLUE}----------------------------------------${NC}"
+echo -e "${GREEN}[!] Press Enter to open Cloudflare Login page in your browser...${NC}"
+read -p ""
+# دستور لاگین که مرورگر رو باز میکنه
+npx wrangler login
 
-echo -e "${GREEN}[+] Token Verified. Account ID: $ACCOUNT_ID${NC}"
+# 4. دریافت اطلاعات اکانت
+echo -e "${YELLOW}[*] Fetching Account Info...${NC}"
+ACCOUNT_ID=$(npx wrangler whoami | grep "Account ID" | awk '{print $3}')
 
-# 4. تنظیمات نام پروژه و KV (سوال از کاربر)
+if [ -z "$ACCOUNT_ID" ]; then
+    echo -e "${RED}[!] Login failed or Account ID not found.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}[+] Logged in! Account ID: $ACCOUNT_ID${NC}"
+
+# 5. تنظیمات نام
 echo -e "${YELLOW}----------------------------------------${NC}"
-
-# KV Name
-read -p "Do you want a custom name for KV? (y/n): " KV_OPT
-if [[ "$KV_OPT" == "y" || "$KV_OPT" == "Y" ]]; then
+read -p "Do you want custom names? (y/n): " OPT
+if [[ "$OPT" == "y" || "$OPT" == "Y" ]]; then
+    read -p "Enter Project Name: " WORKER_NAME
     read -p "Enter KV Name: " KV_TITLE
 else
     RAND=$(tr -dc a-z0-9 </dev/urandom | head -c 5)
-    KV_TITLE="bp_kv_$RAND"
-    echo -e "Using Random KV Name: ${BLUE}$KV_TITLE${NC}"
-fi
-
-# Worker Name
-read -p "Do you want a custom name for Project (Worker)? (y/n): " WORKER_OPT
-if [[ "$WORKER_OPT" == "y" || "$WORKER_OPT" == "Y" ]]; then
-    read -p "Enter Project Name: " WORKER_NAME
-else
-    RAND=$(tr -dc a-z0-9 </dev/urandom | head -c 5)
     WORKER_NAME="bp-panel-$RAND"
-    echo -e "Using Random Worker Name: ${BLUE}$WORKER_NAME${NC}"
+    KV_TITLE="bp_kv_$RAND"
+    echo -e "Random Name: $WORKER_NAME"
 fi
 
-# 5. ساخت KV
+# 6. ساخت KV Namespace با Wrangler
 echo -e "${YELLOW}[*] Creating KV Namespace...${NC}"
-KV_RES=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/storage/kv/namespaces" \
-     -H "Authorization: Bearer $CF_TOKEN" \
-     -H "Content-Type: application/json" \
-     --data "{\"title\": \"$KV_TITLE\"}")
+KV_ID_OUTPUT=$(npx wrangler kv:namespace create "$KV_TITLE" 2>&1)
+# استخراج ID از خروجی
+KV_ID=$(echo "$KV_ID_OUTPUT" | grep -oE 'id = "[^"]+"' | cut -d'"' -f2)
 
-KV_ID=$(echo $KV_RES | jq -r '.result.id')
-
-if [ "$KV_ID" == "null" ] || [ -z "$KV_ID" ]; then
-    echo -e "${RED}[!] Failed to create KV Namespace.${NC}"
-    echo $KV_RES
-    exit 1
-fi
-echo -e "${GREEN}[+] KV Created (ID: $KV_ID)${NC}"
-
-# 6. ساخت فایل متادیتا (بایندینگ KV)
-# نکته مهم: اینجا name رو دقیقاً KV گذاشتیم
-echo "{\"body_part\":\"script\",\"bindings\":[{\"type\":\"kv_namespace\",\"name\":\"KV\",\"namespace_id\":\"$KV_ID\"}]}" > metadata.json
-
-# 7. آپلود و دیپلوی ورکر
-echo -e "${YELLOW}[*] Deploying Worker ($WORKER_NAME)...${NC}"
-
-UPLOAD_RES=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME" \
-     -H "Authorization: Bearer $CF_TOKEN" \
-     -F "metadata=@metadata.json;type=application/json" \
-     -F "script=@worker.js;type=application/javascript")
-
-SUCCESS=$(echo $UPLOAD_RES | jq -r '.success')
-
-if [ "$SUCCESS" != "true" ]; then
-    echo -e "${RED}[!] Upload Failed!${NC}"
-    echo $UPLOAD_RES
-    exit 1
+if [ -z "$KV_ID" ]; then
+    # اگر قبلا وجود داشته باشه، سعی میکنیم پیداش کنیم (ساده‌سازی شده)
+    echo -e "${YELLOW}[!] KV might already exist, trying to list...${NC}"
+    KV_ID=$(npx wrangler kv:namespace list | grep -B 1 "$KV_TITLE" | grep "id" | cut -d'"' -f4)
 fi
 
-# فعال کردن ساب‌دامین
-curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts/$WORKER_NAME/subdomain" \
-     -H "Authorization: Bearer $CF_TOKEN" \
-     -H "Content-Type: application/json" \
-     --data '{"enabled":true}' > /dev/null
+echo -e "${GREEN}[+] KV ID: $KV_ID${NC}"
 
-# دریافت آدرس ساب‌دامین کاربر
-SUBDOMAIN=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/subdomain" \
-    -H "Authorization: Bearer $CF_TOKEN" | jq -r '.result.subdomain')
+# 7. ساخت فایل کانفیگ wrangler.toml
+echo -e "${YELLOW}[*] Generating Config...${NC}"
+cat << EOF > wrangler.toml
+name = "$WORKER_NAME"
+main = "worker.js"
+compatibility_date = "2023-10-30"
 
-# 8. پایان
+[[kv_namespaces]]
+binding = "KV"
+id = "$KV_ID"
+EOF
+
+# 8. دیپلوی نهایی
+echo -e "${BLUE}[*] Deploying to Cloudflare...${NC}"
+npx wrangler deploy
+
 echo -e "${BLUE}=========================================${NC}"
-echo -e "${GREEN}✅ Installation Completed Successfully!${NC}"
-echo -e "🔗 Your Panel URL: ${YELLOW}https://$WORKER_NAME.$SUBDOMAIN.workers.dev${NC}"
+echo -e "${GREEN}✅ Installation Completed!${NC}"
+echo -e "Your Panel is running on the URL shown above 👆"
 echo -e "${BLUE}=========================================${NC}"
 
-# پاک کردن فایل‌های موقت
-rm worker.js metadata.json
+# پاکسازی
+rm worker.js wrangler.toml
